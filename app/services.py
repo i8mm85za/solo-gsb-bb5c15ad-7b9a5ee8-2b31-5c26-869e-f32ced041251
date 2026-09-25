@@ -1,4 +1,5 @@
 """业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照。"""
+import bisect
 import hashlib
 import json
 import math
@@ -921,3 +922,104 @@ def get_handoff(
 ) -> tuple[models.HandoffSnapshot, list[models.HandoffSnapshotItem]] | None:
     """按交接编号查询已冻结的快照与明细；不存在返回 None，由路由层转 404。"""
     return _load_handoff(db, handoff_code)
+
+
+def _lis_length(seq: list[int]) -> int:
+    """整数序列的最长严格递增子序列长度（O(n log n)，patience sorting）。
+
+    tails[k] = 所有长度 k+1 的递增子序列中最小的尾值；新值二分替换到第一个
+    >= 它的尾值（bisect_left，严格递增），比所有尾值大时追加。
+    """
+    tails: list[int] = []
+    for value in seq:
+        pos = bisect.bisect_left(tails, value)
+        if pos == len(tails):
+            tails.append(value)
+        else:
+            tails[pos] = value
+    return len(tails)
+
+
+def reconcile_handoffs(
+    db: Session, from_code: str, to_code: str
+) -> schemas.HandoffReconcileResult:
+    """比较两份**已冻结**交接快照的明细（只读，不重新查询箱子的当前事件）。
+
+    - 任一份快照不存在：抛 404（handoff_not_found），由路由层透传
+    - 新增箱（目标有、来源无）按目标快照顺序列出；移出箱（来源有、目标无）
+      按来源快照顺序列出
+    - 共同箱的冻结结论（status）变化按来源顺序列出，附原/目标结论与冻结序号
+    - 最少移动箱数：共同箱按来源顺序取出其在目标中的位置，该序列的最长严格
+      递增子序列长度即“保持相对顺序即可不动”的箱数，故最少移动 = 共同箱数 - LIS；
+      新增、移出箱不计移动，两份箱单（含顺序）完全一致时为 0
+    """
+    from_result = _load_handoff(db, from_code)
+    if from_result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "handoff_not_found", "handoff_code": from_code},
+        )
+    to_result = _load_handoff(db, to_code)
+    if to_result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "handoff_not_found", "handoff_code": to_code},
+        )
+    _, from_items = from_result
+    _, to_items = to_result
+
+    from_map = {item.box_code: item for item in from_items}
+    to_map = {item.box_code: item for item in to_items}
+
+    def _reconcile_item(item: models.HandoffSnapshotItem) -> schemas.HandoffReconcileItem:
+        return schemas.HandoffReconcileItem(
+            position=item.position,
+            box_code=item.box_code,
+            status=item.status,
+            seq=item.seq,
+            temperature=item.temperature,
+            event_time=item.event_time,
+        )
+
+    added = [_reconcile_item(item) for item in to_items if item.box_code not in from_map]
+    removed = [_reconcile_item(item) for item in from_items if item.box_code not in to_map]
+
+    changed: list[schemas.HandoffStatusChange] = []
+    # 共同箱按来源顺序映射到目标位置（箱号在单份快照内唯一，一一对应）
+    target_positions: list[int] = []
+    for item in from_items:
+        target_item = to_map.get(item.box_code)
+        if target_item is None:
+            continue
+        target_positions.append(target_item.position)
+        # 只报告冻结结论的变化；同箱序号可因两次冻结间隔内补报而不同
+        if target_item.status != item.status:
+            changed.append(
+                schemas.HandoffStatusChange(
+                    box_code=item.box_code,
+                    from_position=item.position,
+                    to_position=target_item.position,
+                    from_status=item.status,
+                    to_status=target_item.status,
+                    from_seq=item.seq,
+                    to_seq=target_item.seq,
+                )
+            )
+
+    common_count = len(target_positions)
+    min_moves = common_count - _lis_length(target_positions)
+
+    return schemas.HandoffReconcileResult(
+        from_handoff_code=from_code,
+        to_handoff_code=to_code,
+        from_box_count=len(from_items),
+        to_box_count=len(to_items),
+        common_count=common_count,
+        added_count=len(added),
+        removed_count=len(removed),
+        changed_count=len(changed),
+        min_moves=min_moves,
+        added=added,
+        removed=removed,
+        changed=changed,
+    )

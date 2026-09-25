@@ -128,6 +128,67 @@ class HandoffOut(BaseModel):
     )
 
 
+class HandoffReconcileItem(BaseModel):
+    """新增/移出箱条目：位置 + 所属快照中的冻结明细。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    position: int = Field(
+        ..., description="该箱在所属快照箱单中的位置（从 0 开始，即创建请求列表下标）"
+    )
+    box_code: str
+    status: str = Field(
+        ..., description="冻结结论：normal=正常，out_of_range=越界，missing=缺报"
+    )
+    seq: int | None = Field(..., description="冻结时刻该箱最大事件序号；缺报为 null")
+    temperature: float | None = Field(..., description="冻结时刻的温度（℃）；缺报为 null")
+    event_time: datetime | None = Field(
+        ..., description="冻结时刻的 UTC 事件时间；缺报为 null"
+    )
+
+
+class HandoffStatusChange(BaseModel):
+    box_code: str
+    from_position: int = Field(..., description="来源快照中的位置（从 0 开始）")
+    to_position: int = Field(..., description="目标快照中的位置（从 0 开始）")
+    from_status: str = Field(
+        ..., description="来源快照冻结结论：normal=正常，out_of_range=越界，missing=缺报"
+    )
+    to_status: str = Field(
+        ..., description="目标快照冻结结论：normal=正常，out_of_range=越界，missing=缺报"
+    )
+    from_seq: int | None = Field(..., description="来源快照冻结的最大事件序号；缺报为 null")
+    to_seq: int | None = Field(..., description="目标快照冻结的最大事件序号；缺报为 null")
+
+
+class HandoffReconcileResult(BaseModel):
+    from_handoff_code: str = Field(..., description="来源交接快照编号")
+    to_handoff_code: str = Field(..., description="目标交接快照编号")
+    from_box_count: int = Field(..., description="来源快照箱数")
+    to_box_count: int = Field(..., description="目标快照箱数")
+    common_count: int = Field(..., description="两份快照共同箱的数量")
+    added_count: int = Field(..., description="新增箱数（目标有、来源无）")
+    removed_count: int = Field(..., description="移出箱数（来源有、目标无）")
+    changed_count: int = Field(..., description="共同箱中冻结结论发生变化的箱数")
+    min_moves: int = Field(
+        ...,
+        description=(
+            "把来源箱单顺序调整为目标顺序最少需移动的共同箱数"
+            "（共同箱数 - 来源顺序映射目标位置后的最长递增子序列长度；"
+            "新增、移出箱不计；两份箱单完全一致时为 0）"
+        ),
+    )
+    added: list[HandoffReconcileItem] = Field(
+        ..., description="新增箱（目标有、来源无），按目标快照顺序列出"
+    )
+    removed: list[HandoffReconcileItem] = Field(
+        ..., description="移出箱（来源有、目标无），按来源快照顺序列出"
+    )
+    changed: list[HandoffStatusChange] = Field(
+        ..., description="共同箱中冻结结论发生变化的箱，按来源快照顺序列出"
+    )
+
+
 class ClockAuditItem(BaseModel):
     seq: int = Field(..., description="事件序号")
     original_time: datetime = Field(..., description="原始 UTC 事件时间（不改动原始记录）")

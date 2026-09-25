@@ -11,6 +11,9 @@
 
 此外支持**交接快照**：`POST /handoffs` 在同一事务中按各箱当前最大序号冻结状态与
 缺报/越界/正常结论；快照落库后只读，后续乱序补报不会改写已建快照。
+`GET /handoffs/{from_code}/reconcile/{to_code}` 可对**两份已冻结快照**做只读箱单对账
+（新增/移出/共同箱结论变化，以及按最长递增子序列计算的最少移动箱数），
+对账不重新查询箱子的当前事件。
 
 ## 目录结构
 
@@ -22,7 +25,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 与交接快照模型，(box_code, seq)、handoff_code 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、快照对账（LIS 最少移动数）
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -103,6 +106,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/merkle-proof` | 区间事件的 Merkle 包含证明（按 seq 升序建树，只读不写回） |
 | POST | `/handoffs`                     | 创建交接快照（同一事务冻结各箱当前最大序号的状态，幂等） |
 | GET  | `/handoffs/{handoff_code}`      | 交接快照的冻结明细与各类数量               |
+| GET  | `/handoffs/{from_code}/reconcile/{to_code}` | 两份已冻结快照只读对账：新增/移出/共同箱结论变化 + 最少移动箱数 |
 
 ### 上报事件
 
@@ -769,6 +773,103 @@ curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/jso
   -d '{"handoff_code":"HO-Y","box_codes":["BOX-001"],"temp_lower":2,"temp_upper":-8}'
 ```
 
+## 交接箱单对账（handoff reconcile）
+
+`GET /handoffs/{from_code}/reconcile/{to_code}` 对**两份已冻结快照**做只读对账：
+`{from_code}` 是来源箱单、`{to_code}` 是目标箱单。比较**只读取两张快照的冻结明细**，
+**不会重新查询箱子的当前事件**——因此对账结果不受两次冻结之间（或对账之后）的补报影响，
+重放历史快照对账结果恒定。任一份快照不存在返回 `404 Not Found`。
+
+对账内容：
+
+- **新增箱**（目标有、来源无）：按**目标快照顺序**列出，带目标位置与冻结结论、序号等；
+- **移出箱**（来源有、目标无）：按**来源快照顺序**列出，带来源位置与冻结明细；
+- **共同箱结论变化**：两份快照都有的箱，若冻结结论（`normal`/`out_of_range`/`missing`）
+  不同，按**来源顺序**列出原/目标结论、原/目标冻结序号与两侧位置；结论相同但序号不同
+  （间隔期补报）不算变化。
+- **最少移动箱数 `min_moves`**：把来源箱单的共同箱部分调整为目标顺序最少需要移动几个箱。
+  新增、移出箱**不计移动**。算法：共同箱按**来源顺序**取出各自在**目标中的位置**，
+  对该位置序列求**最长严格递增子序列（LIS）**——落在 LIS 中的箱相对顺序已与目标一致、
+  可以不动，故 `min_moves = 共同箱数 - LIS 长度`；两份箱单（含顺序）完全一致时为 `0`。
+
+返回字段：
+
+| 字段                | 说明                                                       |
+| ------------------- | ---------------------------------------------------------- |
+| `from_handoff_code` / `to_handoff_code` | 来源 / 目标交接快照编号                       |
+| `from_box_count` / `to_box_count` | 来源 / 目标快照箱数                                 |
+| `common_count`      | 两份快照共同箱的数量                                       |
+| `added_count` / `removed_count` / `changed_count` | 新增 / 移出 / 结论变化箱数          |
+| `min_moves`         | 共同箱由来源顺序调整为目标顺序的最少移动箱数（新增、移出不计） |
+| `added[]`           | 新增箱（按目标顺序）：`position` 及该箱在目标快照中的冻结明细 |
+| `removed[]`         | 移出箱（按来源顺序）：`position` 及该箱在来源快照中的冻结明细 |
+| `changed[]`         | 共同箱结论变化（按来源顺序）：`box_code`、`from_position`/`to_position`、`from_status`/`to_status`、`from_seq`/`to_seq` |
+
+```bash
+# 准备事件：A/B/E 正常、D 越界（上下限 [-8, 2]）；C 暂不上报、X 缺报
+for b in 'A -4.0' 'B -3.0' 'D 9.0' 'E -1.0'; do
+  set -- $b
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"BOX-$1\",\"seq\":0,\"temperature\":$2,\"event_time\":\"2026-09-25T08:00:00+08:00\"}"
+done
+
+# 来源箱单：A, B, C, D, X（C 此时尚未上报 -> 缺报）
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-FROM","box_codes":["BOX-A","BOX-B","BOX-C","BOX-D","BOX-X"],
+       "temp_lower":-8.0,"temp_upper":2.0}'
+
+# 之后补报 C（越界，seq=1），再冻结目标箱单：新增 E、移出 D；共同 A B C X 重排为 A C B X
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-C","seq":1,"temperature":9.5,"event_time":"2026-09-25T09:00:00+08:00"}'
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-TO","box_codes":["BOX-E","BOX-A","BOX-C","BOX-B","BOX-X"],
+       "temp_lower":-8.0,"temp_upper":2.0}'
+
+# 对账（只读两份冻结明细，不查当前事件）
+curl http://localhost:8000/handoffs/HO-FROM/reconcile/HO-TO
+```
+
+响应（共同箱按来源顺序 `A,B,C,X` 的目标位置为 `1,3,2,4`，LIS 长度 3，
+故最少移动 `4 - 3 = 1`；新增 `BOX-E`、移出 `BOX-D`、`BOX-C` 由缺报变为越界）：
+
+```json
+{
+  "from_handoff_code": "HO-FROM",
+  "to_handoff_code": "HO-TO",
+  "from_box_count": 5,
+  "to_box_count": 5,
+  "common_count": 4,
+  "added_count": 1,
+  "removed_count": 1,
+  "changed_count": 1,
+  "min_moves": 1,
+  "added": [
+    {"position": 0, "box_code": "BOX-E", "status": "normal",
+     "seq": 0, "temperature": -1.0, "event_time": "2026-09-25T00:00:00"}
+  ],
+  "removed": [
+    {"position": 3, "box_code": "BOX-D", "status": "out_of_range",
+     "seq": 0, "temperature": 9.0, "event_time": "2026-09-25T00:00:00"}
+  ],
+  "changed": [
+    {"box_code": "BOX-C", "from_position": 2, "to_position": 2,
+     "from_status": "missing", "to_status": "out_of_range",
+     "from_seq": null, "to_seq": 1}
+  ]
+}
+```
+
+```bash
+# 两份箱单完全一致（共同箱位置序列本身即递增，LIS = 共同箱数）-> min_moves = 0
+curl http://localhost:8000/handoffs/HO-FROM/reconcile/HO-FROM
+
+# 纯重排：[A,B,C] -> [C,B,A]，位置序列 [2,1,0]，LIS=1 -> min_moves = 2
+
+# 任一快照不存在 -> 404
+curl -i http://localhost:8000/handoffs/NO-SUCH/reconcile/HO-TO
+curl -i http://localhost:8000/handoffs/HO-FROM/reconcile/NO-SUCH
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -812,6 +913,14 @@ curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/jso
   `handoff_code` 有唯一约束，并发下同编号创建由 `IntegrityError` 兜底重判。
   快照行只增不改，后续事件补报（含乱序）只写 `box_events`，不会触碰已建快照；
   同编号同内容（箱号列表及顺序、温度上下限）的重复请求直接返回原快照，内容不同返回 409。
+- **快照对账只读**：`GET /handoffs/{from_code}/reconcile/{to_code}` 只读
+  `handoff_snapshot_items` 的冻结行，按箱号集合求新增（目标独有，按目标顺序）、
+  移出（来源独有，按来源顺序）与共同箱结论变化（`status` 不同才计入，按来源顺序，
+  附原/目标结论与冻结序号），**不重新查询 `box_events`**，故任何补报都不会改变
+  历史快照的对账结果。最少移动箱数只针对共同箱：按来源顺序取其目标位置得到一个排列，
+  最长严格递增子序列（patience sorting，O(n log n)）中的箱相对顺序已与目标一致可不动，
+  其余即最少移动数（共同箱数 − LIS）；新增、移出不参与，两份箱单含顺序完全一致时为 0。
+  任一份快照不存在返回 404。
 - **校验错误兜底**：请求体携带 `NaN`/`Infinity` 时，校验错误的详情里会带上这些
   非有限浮点，而 Starlette 的 JSON 响应不允许序列化它们；`main.py` 自定义了
   `RequestValidationError` 处理器，先把错误详情中的 NaN/Inf 替换为字符串再返回 422，

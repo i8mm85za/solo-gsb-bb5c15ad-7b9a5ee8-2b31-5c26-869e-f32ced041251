@@ -31,8 +31,11 @@ app = FastAPI(
         "- 乱序事件正常入库，最新状态始终按最大序号返回\n"
         "- 交接快照：POST /handoffs 在同一事务中冻结各箱当前状态；"
         "同编号同内容幂等返回原快照，内容不同拒绝（409）；快照只读，不受后续补报影响\n"
+        "- 快照对账：GET /handoffs/{from_code}/reconcile/{to_code} 只比较两份已冻结"
+        "快照的明细（不重查当前事件），列新增/移出/结论变化，并按最长递增子序列给出"
+        "最少移动箱数\n"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -200,6 +203,19 @@ def get_handoff(handoff_code: str, db: DbSession) -> schemas.HandoffOut:
         )
     snapshot, items = result
     return _handoff_out(snapshot, items)
+
+
+@app.get(
+    "/handoffs/{from_code}/reconcile/{to_code}",
+    tags=["handoffs"],
+    response_model=schemas.HandoffReconcileResult,
+    summary="两份已冻结交接快照的只读对账（新增/移出/结论变化 + 最少移动箱数）",
+)
+def reconcile_handoffs(
+    from_code: str, to_code: str, db: DbSession
+) -> schemas.HandoffReconcileResult:
+    # 仅比较两份已冻结快照的明细，不重新查询箱子的当前事件；任一快照不存在由 service 抛 404
+    return services.reconcile_handoffs(db, from_code.strip(), to_code.strip())
 
 
 @app.get(
