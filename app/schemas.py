@@ -128,6 +128,56 @@ class HandoffOut(BaseModel):
     )
 
 
+class HandoffReconcileAddedBox(BaseModel):
+    box_code: str = Field(..., description="新增箱号（只在目标快照中）")
+    to_status: str = Field(..., description="目标快照中的冻结结论")
+    to_seq: int | None = Field(..., description="目标快照中的冻结序号；缺报为 null")
+
+
+class HandoffReconcileRemovedBox(BaseModel):
+    box_code: str = Field(..., description="移出箱号（只在来源快照中）")
+    from_status: str = Field(..., description="来源快照中的冻结结论")
+    from_seq: int | None = Field(..., description="来源快照中的冻结序号；缺报为 null")
+
+
+class HandoffReconcileCommonBox(BaseModel):
+    box_code: str
+    from_status: str = Field(..., description="来源快照中的冻结结论")
+    to_status: str = Field(..., description="目标快照中的冻结结论")
+    from_seq: int | None = Field(..., description="来源快照中的冻结序号；缺报为 null")
+    to_seq: int | None = Field(..., description="目标快照中的冻结序号；缺报为 null")
+    status_changed: bool = Field(
+        ..., description="冻结结论是否变化（from_status != to_status）"
+    )
+
+
+class HandoffReconcileResult(BaseModel):
+    from_code: str = Field(..., description="来源交接编号")
+    to_code: str = Field(..., description="目标交接编号")
+    from_box_count: int = Field(..., description="来源快照箱数")
+    to_box_count: int = Field(..., description="目标快照箱数")
+    added_count: int = Field(..., description="新增箱数（只在目标快照中）")
+    removed_count: int = Field(..., description="移出箱数（只在来源快照中）")
+    common_count: int = Field(..., description="共同箱数（两份快照都有）")
+    status_changed_count: int = Field(..., description="共同箱中冻结结论变化的箱数")
+    lis_length: int = Field(
+        ..., description="共同箱按来源顺序映射到目标位置后的最长递增子序列长度"
+    )
+    min_moves: int = Field(
+        ...,
+        description="最少需移动箱数 = common_count - lis_length；新增、移出不计移动",
+    )
+    added_boxes: list[HandoffReconcileAddedBox] = Field(
+        ..., description="新增箱，按目标快照顺序列出"
+    )
+    removed_boxes: list[HandoffReconcileRemovedBox] = Field(
+        ..., description="移出箱，按来源快照顺序列出"
+    )
+    common_boxes: list[HandoffReconcileCommonBox] = Field(
+        ..., description="共同箱，按来源快照顺序列出"
+    )
+
+
 class ClockAuditItem(BaseModel):
     seq: int = Field(..., description="事件序号")
     original_time: datetime = Field(..., description="原始 UTC 事件时间（不改动原始记录）")

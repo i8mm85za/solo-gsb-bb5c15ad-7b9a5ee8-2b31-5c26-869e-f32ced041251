@@ -1,7 +1,8 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账。"""
 import hashlib
 import json
 import math
+from bisect import bisect_left
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from fastapi import HTTPException, status
@@ -921,3 +922,113 @@ def get_handoff(
 ) -> tuple[models.HandoffSnapshot, list[models.HandoffSnapshotItem]] | None:
     """按交接编号查询已冻结的快照与明细；不存在返回 None，由路由层转 404。"""
     return _load_handoff(db, handoff_code)
+
+
+def _lis_length(positions: list[int]) -> int:
+    """最长严格递增子序列的长度（耐心排序，O(n log n)）。
+
+    输入为共同箱按来源顺序映射到的目标位置序列；快照内箱号唯一，
+    位置互不相同，bisect_left 即得到严格递增的 LIS 长度。
+    """
+    tails: list[int] = []
+    for x in positions:
+        i = bisect_left(tails, x)
+        if i == len(tails):
+            tails.append(x)
+        else:
+            tails[i] = x
+    return len(tails)
+
+
+def reconcile_handoffs(
+    db: Session, from_code: str, to_code: str
+) -> schemas.HandoffReconcileResult:
+    """对账两份已冻结快照的箱单明细（只读，不重新查询箱子当前事件）。
+
+    - 新增箱：只在目标快照中的箱号，按目标快照顺序列出
+    - 移出箱：只在来源快照中的箱号，按来源快照顺序列出
+    - 共同箱：两份快照都有的箱号，按来源快照顺序列出，给出原/目标结论与序号
+    - 顺序移动：共同箱按来源顺序映射到目标位置后求最长递增子序列（LIS），
+      最少需移动箱数 = 共同箱数 - LIS 长度；新增、移出不计移动，
+      两份箱单相同（共同箱相对顺序一致）时为 0
+    - 来源或目标快照不存在：抛 404（handoff_not_found）
+    """
+    from_loaded = _load_handoff(db, from_code)
+    if from_loaded is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "handoff_not_found",
+                "message": f"来源交接快照 {from_code} 不存在",
+                "handoff_code": from_code,
+            },
+        )
+    to_loaded = _load_handoff(db, to_code)
+    if to_loaded is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "handoff_not_found",
+                "message": f"目标交接快照 {to_code} 不存在",
+                "handoff_code": to_code,
+            },
+        )
+    _, from_items = from_loaded
+    _, to_items = to_loaded
+
+    from_by_code = {item.box_code: item for item in from_items}
+    to_by_code = {item.box_code: item for item in to_items}
+
+    added = [item for item in to_items if item.box_code not in from_by_code]
+    removed = [item for item in from_items if item.box_code not in to_by_code]
+    # 共同箱按来源快照顺序；LIS 的位置映射也基于该顺序
+    common = [item for item in from_items if item.box_code in to_by_code]
+
+    to_position = {item.box_code: index for index, item in enumerate(to_items)}
+    mapped_positions = [to_position[item.box_code] for item in common]
+    lis_length = _lis_length(mapped_positions)
+    min_moves = len(common) - lis_length
+
+    common_boxes: list[schemas.HandoffReconcileCommonBox] = []
+    status_changed_count = 0
+    for from_item in common:
+        to_item = to_by_code[from_item.box_code]
+        changed = from_item.status != to_item.status
+        if changed:
+            status_changed_count += 1
+        common_boxes.append(
+            schemas.HandoffReconcileCommonBox(
+                box_code=from_item.box_code,
+                from_status=from_item.status,
+                to_status=to_item.status,
+                from_seq=from_item.seq,
+                to_seq=to_item.seq,
+                status_changed=changed,
+            )
+        )
+
+    return schemas.HandoffReconcileResult(
+        from_code=from_code,
+        to_code=to_code,
+        from_box_count=len(from_items),
+        to_box_count=len(to_items),
+        added_count=len(added),
+        removed_count=len(removed),
+        common_count=len(common),
+        status_changed_count=status_changed_count,
+        lis_length=lis_length,
+        min_moves=min_moves,
+        added_boxes=[
+            schemas.HandoffReconcileAddedBox(
+                box_code=item.box_code, to_status=item.status, to_seq=item.seq
+            )
+            for item in added
+        ],
+        removed_boxes=[
+            schemas.HandoffReconcileRemovedBox(
+                box_code=item.box_code, from_status=item.status, from_seq=item.seq
+            )
+            for item in removed
+        ],
+        common_boxes=common_boxes,
+    )
